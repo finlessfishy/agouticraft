@@ -8,9 +8,7 @@ import pygame
 from pygame.locals import DOUBLEBUF, OPENGL
 
 import traceback
-
 import sys
-
 import os
 
 def resource_path(relative_path):
@@ -21,7 +19,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-ACversion = "0.4.13"
+ACversion = "0.5.14"
 
 # ============================================================================
 #  Config
@@ -161,6 +159,25 @@ out vec4 f_color;
 void main() {
     vec4 tex_color = texture(atlas, vec3(v_uv, v_tile_idx));
     f_color = vec4(tex_color.rgb * (1.0 - dark_factor * 0.85), tex_color.a);
+}
+"""
+
+LINE_VERT_SHADER = """
+#version 330
+uniform mat4 mvp;
+in vec3 in_position;
+
+void main() {
+    gl_Position = mvp * vec4(in_position, 1.0);
+}
+"""
+
+LINE_FRAG_SHADER = """
+#version 330
+out vec4 f_color;
+
+void main() {
+    f_color = vec4(1.0, 1.0, 0.0, 1.0); // RGBA: Bright Yellow
 }
 """
 
@@ -506,7 +523,7 @@ def try_place_block(blocks, inventory, cell, player_pos):
 
 
 # ============================================================================
-#  Block destruction visuals
+#  Block destruction & Selection visuals
 # ============================================================================
 def build_overlay_block_mesh(blocks, atlas, cell):
     x, y, z = cell
@@ -528,9 +545,40 @@ def build_overlay_block_mesh(blocks, atlas, cell):
         for idx in (0, 1, 2, 0, 2, 3):
             vx, vy, vz = quad[idx]
             u, v = UV_QUAD[idx]
-            # Must match OVERLAY_VERT_SHADER layout: in_position (3f), in_uv (2f), in_tile_idx (1f)
             verts.extend((vx, vy, vz, u, v, layer))
 
+    return np.array(verts, dtype="f4")
+
+
+def build_block_outline_mesh(cell):
+    x, y, z = cell
+    eps = 0.002  # Inflate slightly to eliminate Z-fighting against faces
+    x0, x1 = x - eps, x + 1 + eps
+    y0, y1 = y - eps, y + 1 + eps
+    z0, z1 = z - eps, z + 1 + eps
+
+    # 12 edges (2 vertices per line = 24 points)
+    edges = [
+        # Bottom square
+        (x0, y0, z0), (x1, y0, z0),
+        (x1, y0, z0), (x1, y0, z1),
+        (x1, y0, z1), (x0, y0, z1),
+        (x0, y0, z1), (x0, y0, z0),
+        # Top square
+        (x0, y1, z0), (x1, y1, z0),
+        (x1, y1, z0), (x1, y1, z1),
+        (x1, y1, z1), (x0, y1, z1),
+        (x0, y1, z1), (x0, y1, z0),
+        # Vertical edges connecting top and bottom
+        (x0, y0, z0), (x0, y1, z0),
+        (x1, y0, z0), (x1, y1, z0),
+        (x1, y0, z1), (x1, y1, z1),
+        (x0, y0, z1), (x0, y1, z1),
+    ]
+
+    verts = []
+    for p in edges:
+        verts.extend(p)
     return np.array(verts, dtype="f4")
 
 
@@ -724,7 +772,6 @@ def get_ui_texture(block_id):
                 img = pygame.transform.scale(img, (SLOT_SIZE - 10, SLOT_SIZE - 10))
                 loaded_ui_textures[block_id] = img
             except Exception as e:
-                # Catching exception prevents instant exit
                 print(f"Warning: Could not load UI texture {filename}: {e}")
                 loaded_ui_textures[block_id] = None
         else:
@@ -797,8 +844,13 @@ def render_ui_surface(inventory, crafting_open, mouse_pos):
         result_rect = pygame.Rect(panel_x + 210, panel_y + 65, SLOT_SIZE, SLOT_SIZE)
         ui_rects['result'] = result_rect
         draw_slot(surf, result_rect, inventory.crafting_result, font, border_color=(0, 255, 0))
+    else:
+        # 3. Simple Dot Crosshair
+        cx, cy = WIDTH // 2, HEIGHT // 2
+        pygame.draw.circle(surf, (0, 0, 0, 200), (cx, cy), 3)        # Outer border
+        pygame.draw.circle(surf, (255, 255, 255, 230), (cx, cy), 2)  # Inner dot
 
-    # 3. Item Held by Cursor
+    # 4. Item Held by Cursor
     if inventory.cursor_slot.block_id != BLOCK_AIR:
         mx, my = mouse_pos
         cursor_rect = pygame.Rect(mx - SLOT_SIZE // 2, my - SLOT_SIZE // 2, SLOT_SIZE, SLOT_SIZE)
@@ -940,6 +992,11 @@ def main():
     
     break_vbo = ctx.buffer(reserve=36 * 6 * 4, dynamic=True) # 6 floats per vertex (3f 2f 1f)
     break_vao = ctx.vertex_array(overlay_prog, [(break_vbo, "3f 2f 1f", "in_position", "in_uv", "in_tile_idx")])
+
+    line_prog = ctx.program(vertex_shader=LINE_VERT_SHADER, fragment_shader=LINE_FRAG_SHADER)
+    line_mvp = line_prog["mvp"]
+    line_vbo = ctx.buffer(reserve=24 * 3 * 4, dynamic=True) # 24 verts * 3f
+    line_vao = ctx.vertex_array(line_prog, [(line_vbo, "3f", "in_position")])
 
     hud_prog = ctx.program(vertex_shader=HUD_VERT_SHADER, fragment_shader=HUD_FRAG_SHADER)
     hud_prog["screen_size"].value = (WIDTH, HEIGHT)
@@ -1107,6 +1164,14 @@ def main():
                 overlay_dark_factor.value = float(mining_progress)
                 break_vbo.write(overlay_mesh.tobytes())
                 break_vao.render(moderngl.TRIANGLES)
+
+        # Render Block Selection Wireframe Outline
+        if hit_cell is not None and not crafting_open:
+            outline_mesh = build_block_outline_mesh(hit_cell)
+            if len(outline_mesh) > 0:
+                upload_matrix(line_mvp, mvp_matrix)
+                line_vbo.write(outline_mesh.tobytes())
+                line_vao.render(moderngl.LINES)
 
         # Render 2D UI Overlay
         ctx.disable(moderngl.DEPTH_TEST)
