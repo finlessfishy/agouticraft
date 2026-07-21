@@ -1,0 +1,11 @@
+pyinstaller --onefile \
+  --hidden-import glcontext \
+  --add-data "textures/grass.jpg:." \
+  --add-data "textures/dirt.jpg:." \
+  --add-data "textures/stone.webp:." \
+  --add-data "textures/log.webp:." \
+  --add-data "textures/leaf.jpg:." \
+  --add-data "textures/bedrock.jpeg:." \
+  --add-data "textures/plank.jpeg:." \
+    --add-data "textures/brownagouti.jpg:." \
+  main.py

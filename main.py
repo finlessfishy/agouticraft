@@ -7,7 +7,21 @@ import moderngl
 import pygame
 from pygame.locals import DOUBLEBUF, OPENGL
 
-ACversion = "0.2.10"
+import traceback
+
+import sys
+
+import os
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+ACversion = "0.4.13"
 
 # ============================================================================
 #  Config
@@ -57,16 +71,16 @@ BLOCK_BREAK_TIMES = {
 
 # Mapping block IDs to texture files
 TEXTURE_FILES = {
-    BLOCK_GRASS:   "grass.jpg",
-    BLOCK_DIRT:    "dirt.jpg",
-    BLOCK_STONE:   "stone.webp",
-    BLOCK_WOOD:    "log.webp",
-    BLOCK_LEAVES:  "leaf.jpg",
-    BLOCK_SAND:    "dirt.jpg",     # Fallback to dirt if sand texture not provided
-    BLOCK_GRAVEL:  "stone.webp",   # Fallback to stone if gravel texture not provided
-    BLOCK_BEDROCK: "bedrock.jpeg",
-    BLOCK_PLANKS:  "plank.jpeg",
-    BLOCK_AGOUTI:  "brownagouti.jpg",
+    BLOCK_GRASS:   "textures/grass.jpg",
+    BLOCK_DIRT:    "textures/dirt.jpg",
+    BLOCK_STONE:   "textures/stone.webp",
+    BLOCK_WOOD:    "textures/log.webp",
+    BLOCK_LEAVES:  "textures/leaf.jpg",
+    BLOCK_SAND:    "textures/dirt.jpg",     # Fallback to dirt if sand texture not provided
+    BLOCK_GRAVEL:  "textures/stone.webp",   # Fallback to stone if gravel texture not provided
+    BLOCK_BEDROCK: "textures/bedrock.jpeg",
+    BLOCK_PLANKS:  "textures/plank.jpeg",
+    BLOCK_AGOUTI:  "textures/brownagouti.jpg",
 }
 
 # Face Direction Definitions
@@ -172,23 +186,27 @@ class TextureAtlas:
             self.block_to_layer[block_id] = idx
 
             try:
-                img = pygame.image.load(filename).convert_alpha()
+                img_path = resource_path(filename)
+                img = pygame.image.load(img_path).convert_alpha()
                 img = pygame.transform.scale(img, (size, size))
-            except Exception:
+            except Exception as e:
+                print(f"Failed to load texture {filename}: {e}")
                 img = pygame.Surface((size, size))
                 img.fill((200, 0, 200))
 
             raw_data = pygame.image.tostring(img, "RGBA", False)
             atlas_data.extend(raw_data)
 
+        # Create ModernGL Texture Array from bundled texture data
         self.texture_array = self.ctx.texture_array(
-            (size, size, num_layers), 4, bytes(atlas_data)
+            (size, size, num_layers), 
+            4, 
+            bytes(atlas_data)
         )
         self.texture_array.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
     def get_layer(self, block_id):
         return float(self.block_to_layer.get(block_id, 0))
-
 
 # ============================================================================
 #  World Generation
@@ -701,10 +719,13 @@ def get_ui_texture(block_id):
         filename = TEXTURE_FILES.get(block_id, None)
         if filename:
             try:
-                img = pygame.image.load(filename).convert_alpha()
+                img_path = resource_path(filename)
+                img = pygame.image.load(img_path).convert_alpha()
                 img = pygame.transform.scale(img, (SLOT_SIZE - 10, SLOT_SIZE - 10))
                 loaded_ui_textures[block_id] = img
-            except Exception:
+            except Exception as e:
+                # Catching exception prevents instant exit
+                print(f"Warning: Could not load UI texture {filename}: {e}")
                 loaded_ui_textures[block_id] = None
         else:
             loaded_ui_textures[block_id] = None
@@ -1102,4 +1123,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("\n" + "="*50, file=sys.stderr)
+        print("CRITICAL RUNTIME ERROR CATCH:", file=sys.stderr)
+        print("="*50, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print("="*50 + "\n", file=sys.stderr)
+        input("Press ENTER to exit...")
