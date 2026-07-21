@@ -19,7 +19,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-ACversion = "0.5.14"
+ACversion = "0.5.15"
 
 # ============================================================================
 #  Config
@@ -28,6 +28,7 @@ WIDTH, HEIGHT = 1280, 720
 WORLD_X, WORLD_Z = 64, 64
 WORLD_Y = 32
 CHUNK_SIZE = 16
+WATER_LEVEL = 8  # Adjusted water level for flatter terrain
 
 FOV_Y = 70.0
 NEAR, FAR = 0.05, 300.0
@@ -53,6 +54,7 @@ BLOCK_GRAVEL  = 7
 BLOCK_BEDROCK = 8
 BLOCK_PLANKS  = 9
 BLOCK_AGOUTI  = 10
+BLOCK_WATER   = 11
 
 BLOCK_BREAK_TIMES = {
     BLOCK_LEAVES:  0.2,
@@ -64,7 +66,8 @@ BLOCK_BREAK_TIMES = {
     BLOCK_WOOD:    1.2,
     BLOCK_STONE:   1.8,
     BLOCK_BEDROCK: float('inf'),
-    BLOCK_AGOUTI:   0.5,
+    BLOCK_AGOUTI:  0.5,
+    BLOCK_WATER:   float('inf'),
 }
 
 # Mapping block IDs to texture files
@@ -74,11 +77,12 @@ TEXTURE_FILES = {
     BLOCK_STONE:   "textures/stone.webp",
     BLOCK_WOOD:    "textures/log.webp",
     BLOCK_LEAVES:  "textures/leaf.jpg",
-    BLOCK_SAND:    "textures/dirt.jpg",     # Fallback to dirt if sand texture not provided
-    BLOCK_GRAVEL:  "textures/stone.webp",   # Fallback to stone if gravel texture not provided
+    BLOCK_SAND:    "textures/sand.png",
+    BLOCK_GRAVEL:  "textures/stone.webp",
     BLOCK_BEDROCK: "textures/bedrock.jpeg",
     BLOCK_PLANKS:  "textures/plank.jpeg",
     BLOCK_AGOUTI:  "textures/brownagouti.jpg",
+    BLOCK_WATER:   "textures/water.jpeg",
 }
 
 # Face Direction Definitions
@@ -125,6 +129,10 @@ out vec4 f_color;
 
 void main() {
     vec4 tex_color = texture(atlas, vec3(v_uv, v_tile_idx));
+    // Apply slight transparency if drawing water
+    if (v_tile_idx == 10.0) { // Water tile index
+        tex_color.a = 0.65;
+    }
     f_color = vec4(tex_color.rgb * v_brightness, tex_color.a);
 }
 """
@@ -272,23 +280,39 @@ def add_tree(blocks, tx, ty, tz):
 
 
 def generate_world():
-    n1 = value_noise_2d(WORLD_X, WORLD_Z, scale=12, seed=1)
-    n2 = value_noise_2d(WORLD_X, WORLD_Z, scale=6, seed=2)
+    # Multi-octave noise: n1 gives broad hill structures, n2 adds local variation
+    n1 = value_noise_2d(WORLD_X, WORLD_Z, scale=16, seed=1)
+    n2 = value_noise_2d(WORLD_X, WORLD_Z, scale=8, seed=2)
+    
+    # Combined height map with moderate hill variance
     height_map = n1 * 0.7 + n2 * 0.3
 
     blocks = np.zeros((WORLD_X, WORLD_Y, WORLD_Z), dtype=np.int8)
     for x in range(WORLD_X):
         for z in range(WORLD_Z):
-            h = int(8 + height_map[x, z] * 12)
+            # Base height centered around 6, scaling up to ~20 for solid rolling hills
+            h = int(6 + height_map[x, z] * 14)
             h = max(1, min(h, WORLD_Y - 1))
+            
             blocks[x, 0, z] = BLOCK_BEDROCK
-            blocks[x, 1:h - 3, z] = BLOCK_STONE
-            blocks[x, max(1, h - 3):h - 1, z] = BLOCK_DIRT
-            match random.randint(0, 5):
-                case 5:
-                    blocks[x, h - 1, z] = BLOCK_AGOUTI
-                case _:
-                    blocks[x, h - 1, z] = BLOCK_GRASS
+            blocks[x, 1:max(1, h - 3), z] = BLOCK_STONE
+
+            # Coastal/water vs inland biome generation
+            is_beach = h <= WATER_LEVEL + 1
+            if is_beach:
+                blocks[x, max(1, h - 3):h, z] = BLOCK_SAND
+            else:
+                blocks[x, max(1, h - 3):h - 1, z] = BLOCK_DIRT
+                match random.randint(0, 5):
+                    case 5:
+                        blocks[x, h - 1, z] = BLOCK_AGOUTI
+                    case _:
+                        blocks[x, h - 1, z] = BLOCK_GRASS
+
+            # Fill body of water up to WATER_LEVEL
+            if h <= WATER_LEVEL:
+                for y in range(h, WATER_LEVEL + 1):
+                    blocks[x, y, z] = BLOCK_WATER
 
     tree_rng = random.Random(42)
     for x in range(2, WORLD_X - 2):
@@ -304,7 +328,8 @@ def generate_world():
 def is_solid(blocks, x, y, z):
     nx, ny, nz = blocks.shape
     if 0 <= x < nx and 0 <= y < ny and 0 <= z < nz:
-        return blocks[x, y, z] != BLOCK_AIR
+        b = blocks[x, y, z]
+        return b != BLOCK_AIR and b != BLOCK_WATER
     return False
 
 
@@ -320,7 +345,8 @@ def column_top(blocks, x, z):
 def build_chunk_mesh(blocks, atlas, cx, cz):
     x_start, x_end = cx * CHUNK_SIZE, min((cx + 1) * CHUNK_SIZE, WORLD_X)
     z_start, z_end = cz * CHUNK_SIZE, min((cz + 1) * CHUNK_SIZE, WORLD_Z)
-    verts = []
+    opaque_verts = []
+    water_verts = []
 
     for x in range(x_start, x_end):
         for y in range(WORLD_Y):
@@ -331,15 +357,26 @@ def build_chunk_mesh(blocks, atlas, cx, cz):
                 
                 layer = atlas.get_layer(block_id)
                 for (dx, dy, dz), brightness, corners in FACES:
-                    if is_solid(blocks, x + dx, y + dy, z + dz):
+                    neighbor_x, neighbor_y, neighbor_z = x + dx, y + dy, z + dz
+                    
+                    if block_id == BLOCK_WATER:
+                        # Water surfaces only show next to AIR
+                        if 0 <= neighbor_x < WORLD_X and 0 <= neighbor_y < WORLD_Y and 0 <= neighbor_z < WORLD_Z:
+                            if blocks[neighbor_x, neighbor_y, neighbor_z] != BLOCK_AIR:
+                                continue
+                    elif is_solid(blocks, neighbor_x, neighbor_y, neighbor_z):
                         continue
+
                     quad = [(x + cx_off, y + cy_off, z + cz_off) for cx_off, cy_off, cz_off in corners]
                     for idx in (0, 1, 2, 0, 2, 3):
                         vx, vy, vz = quad[idx]
                         u, v = UV_QUAD[idx]
-                        verts.extend((vx, vy, vz, u, v, brightness, layer))
+                        target_list = water_verts if block_id == BLOCK_WATER else opaque_verts
+                        target_list.extend((vx, vy, vz, u, v, brightness, layer))
 
-    return np.array(verts, dtype="f4")
+    # Append transparent water quads at the end of the mesh buffer
+    all_verts = opaque_verts + water_verts
+    return np.array(all_verts, dtype="f4"), len(opaque_verts) // 7, len(water_verts) // 7
 
 
 class ChunkManager:
@@ -360,17 +397,17 @@ class ChunkManager:
 
     def rebuild_chunk(self, cx, cz):
         if (cx, cz) in self.chunks:
-            vbo, vao = self.chunks[(cx, cz)]
+            vbo, vao, o_cnt, w_cnt = self.chunks[(cx, cz)]
             if vbo: vbo.release()
             if vao: vao.release()
 
-        vertex_data = build_chunk_mesh(self.blocks, self.atlas, cx, cz)
+        vertex_data, opaque_count, water_count = build_chunk_mesh(self.blocks, self.atlas, cx, cz)
         if len(vertex_data) > 0:
             vbo = self.ctx.buffer(vertex_data.tobytes())
             vao = self.ctx.vertex_array(self.prog, [(vbo, "3f 2f 1f 1f", "in_position", "in_uv", "in_brightness", "in_tile_idx")])
-            self.chunks[(cx, cz)] = (vbo, vao)
+            self.chunks[(cx, cz)] = (vbo, vao, opaque_count, water_count)
         else:
-            self.chunks[(cx, cz)] = (None, None)
+            self.chunks[(cx, cz)] = (None, None, 0, 0)
 
     def update_block(self, x, y, z):
         cx, cz = x // CHUNK_SIZE, z // CHUNK_SIZE
@@ -385,10 +422,15 @@ class ChunkManager:
         if z % CHUNK_SIZE == CHUNK_SIZE - 1 and cz < self.num_chunks_z - 1:
             self.rebuild_chunk(cx, cz + 1)
 
-    def render(self):
-        for vbo, vao in self.chunks.values():
-            if vao is not None:
-                vao.render(moderngl.TRIANGLES)
+    def render_opaque(self):
+        for vbo, vao, opaque_count, _ in self.chunks.values():
+            if vao is not None and opaque_count > 0:
+                vao.render(moderngl.TRIANGLES, vertices=opaque_count)
+
+    def render_transparent(self):
+        for vbo, vao, opaque_count, water_count in self.chunks.values():
+            if vao is not None and water_count > 0:
+                vao.render(moderngl.TRIANGLES, vertices=water_count, first=opaque_count)
 
 
 # ============================================================================
@@ -503,7 +545,7 @@ def try_place_block(blocks, inventory, cell, player_pos):
     nx, ny, nz = blocks.shape
     if not (0 <= x < nx and 0 <= y < ny and 0 <= z < nz):
         return False
-    if blocks[x, y, z] != BLOCK_AIR:
+    if blocks[x, y, z] != BLOCK_AIR and blocks[x, y, z] != BLOCK_WATER:
         return False
 
     min_corner, max_corner = player_aabb(player_pos)
@@ -899,7 +941,7 @@ def create_window():
 def make_spawn_player(blocks):
     spawn_x, spawn_z = WORLD_X // 2, WORLD_Z // 2
     ground_y = column_top(blocks, spawn_x, spawn_z)
-    spawn_pos = np.array([spawn_x, ground_y + 3.0, spawn_z], dtype="f4")
+    spawn_pos = np.array([spawn_x, max(ground_y, WATER_LEVEL + 1) + 3.0, spawn_z], dtype="f4")
     return Player(pos=spawn_pos, yaw=math.radians(45), pitch=math.radians(-15))
 
 
@@ -964,7 +1006,7 @@ def main():
     create_window()
     dn()
 
-    bf("Creating moderngnl context...")
+    bf("Creating moderngl context...")
     ctx = moderngl.create_context()
     dn()
     bf("Enabling moderngl depth test...")
@@ -1152,9 +1194,14 @@ def main():
 
         ctx.clear(0.55, 0.75, 0.95)
         
-        # Render Terrain
+        # 1. Render Solid Terrain Opaque
         atlas.texture_array.use(location=0)
-        chunk_manager.render()
+        chunk_manager.render_opaque()
+
+        # 2. Render Transparent Water Layers with Alpha Blending enabled
+        ctx.enable(moderngl.BLEND)
+        chunk_manager.render_transparent()
+        ctx.disable(moderngl.BLEND)
 
         # Render Mining Animation Overlay
         if mining_cell is not None and mining_progress > 0.0:
