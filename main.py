@@ -19,7 +19,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-ACversion = "0.6.1"
+ACversion = "0.6.5"
 
 # ============================================================================
 #  Config
@@ -345,39 +345,74 @@ def column_top(blocks, x, z):
 def build_chunk_mesh(blocks, atlas, cx, cz):
     x_start, x_end = cx * CHUNK_SIZE, min((cx + 1) * CHUNK_SIZE, WORLD_X)
     z_start, z_end = cz * CHUNK_SIZE, min((cz + 1) * CHUNK_SIZE, WORLD_Z)
-    opaque_verts = []
-    water_verts = []
 
-    for x in range(x_start, x_end):
-        for y in range(WORLD_Y):
-            for z in range(z_start, z_end):
-                block_id = blocks[x, y, z]
-                if block_id == BLOCK_AIR:
-                    continue
-                
-                layer = atlas.get_layer(block_id)
-                for (dx, dy, dz), brightness, corners in FACES:
-                    neighbor_x, neighbor_y, neighbor_z = x + dx, y + dy, z + dz
-                    
-                    if block_id == BLOCK_WATER:
-                        # Water surfaces only show next to AIR
-                        if 0 <= neighbor_x < WORLD_X and 0 <= neighbor_y < WORLD_Y and 0 <= neighbor_z < WORLD_Z:
-                            if blocks[neighbor_x, neighbor_y, neighbor_z] != BLOCK_AIR:
-                                continue
-                    elif is_solid(blocks, neighbor_x, neighbor_y, neighbor_z):
-                        continue
+    chunk_blocks = blocks[x_start:x_end, :, z_start:z_end]
+    if not np.any(chunk_blocks):
+        return np.array([], dtype="f4"), 0, 0
 
-                    quad = [(x + cx_off, y + cy_off, z + cz_off) for cx_off, cy_off, cz_off in corners]
-                    for idx in (0, 1, 2, 0, 2, 3):
-                        vx, vy, vz = quad[idx]
-                        u, v = UV_QUAD[idx]
-                        target_list = water_verts if block_id == BLOCK_WATER else opaque_verts
-                        target_list.extend((vx, vy, vz, u, v, brightness, layer))
+    padded = np.pad(blocks, 1, mode="constant", constant_values=BLOCK_AIR)
 
-    # Append transparent water quads at the end of the mesh buffer
-    all_verts = opaque_verts + water_verts
-    return np.array(all_verts, dtype="f4"), len(opaque_verts) // 7, len(water_verts) // 7
+    lx, ly, lz = np.indices(chunk_blocks.shape)
+    wx, wy, wz = lx + x_start, ly, lz + z_start
 
+    opaque_quads = []
+    water_quads = []
+
+    for (dx, dy, dz), brightness, corners in FACES:
+        neighbor_blocks = padded[wx + 1 + dx, wy + 1 + dy, wz + 1 + dz]
+
+        water_mask = (chunk_blocks == BLOCK_WATER) & (neighbor_blocks == BLOCK_AIR)
+        solid_neighbor = (neighbor_blocks != BLOCK_AIR) & (neighbor_blocks != BLOCK_WATER)
+        opaque_mask = (chunk_blocks != BLOCK_AIR) & (chunk_blocks != BLOCK_WATER) & (~solid_neighbor)
+
+        for is_water, mask in [(False, opaque_mask), (True, water_mask)]:
+            if not np.any(mask):
+                continue
+
+            visible_blocks = chunk_blocks[mask]
+            vx_base = wx[mask]
+            vy_base = wy[mask]
+            vz_base = wz[mask]
+            n_faces = len(visible_blocks)
+
+            layers = np.array([atlas.get_layer(b) for b in visible_blocks], dtype="f4")
+
+            # Build matrix of 6 vertices per face in exact sequential order
+            face_verts = np.zeros((n_faces, 6, 7), dtype="f4")
+
+            for i, quad_idx in enumerate((0, 1, 2, 0, 2, 3)):
+                cx_off, cy_off, cz_off = corners[quad_idx]
+                u, v = UV_QUAD[quad_idx]
+
+                face_verts[:, i, 0] = vx_base + cx_off
+                face_verts[:, i, 1] = vy_base + cy_off
+                face_verts[:, i, 2] = vz_base + cz_off
+                face_verts[:, i, 3] = u
+                face_verts[:, i, 4] = v
+                face_verts[:, i, 5] = brightness
+                face_verts[:, i, 6] = layers
+
+            # Reshape into flat list of 7-element vertex rows
+            reshaped_verts = face_verts.reshape(-1, 7)
+
+            target_list = water_quads if is_water else opaque_quads
+            target_list.append(reshaped_verts)
+
+    if not opaque_quads and not water_quads:
+        return np.array([], dtype="f4"), 0, 0
+
+    opaque_arr = np.vstack(opaque_quads) if opaque_quads else np.empty((0, 7), dtype="f4")
+    water_arr = np.vstack(water_quads) if water_quads else np.empty((0, 7), dtype="f4")
+
+    opaque_vertex_count = len(opaque_arr)
+    water_vertex_count = len(water_arr)
+
+    if opaque_vertex_count + water_vertex_count == 0:
+        return np.array([], dtype="f4"), 0, 0
+
+    all_verts = np.vstack([opaque_arr, water_arr]).astype("f4").ravel()
+
+    return all_verts, opaque_vertex_count, water_vertex_count
 
 class ChunkManager:
     def __init__(self, ctx, prog, blocks, atlas):
