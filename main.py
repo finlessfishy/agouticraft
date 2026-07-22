@@ -19,7 +19,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-ACversion = "0.5.15"
+ACversion = "0.6.1"
 
 # ============================================================================
 #  Config
